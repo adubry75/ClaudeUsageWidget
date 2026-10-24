@@ -113,7 +113,10 @@ Subagents live in `<session>\subagents\agent-<id>.jsonl` with a
   5h / 7d, so they line up with the bars. Today starts at local midnight.
 - **Breakdown**: top 5 sessions (labelled by working folder), each with up to
   3 rows for `main` and its subagents. A session without subagents gets no
-  child rows.
+  child rows. Sessions sharing a folder name get their start time appended
+  (`Meowntain  Tue 8:55pm`). Hover any row for the full path, start time,
+  in/out/cache split and session id; hover a `+N more` row to see what it
+  folds away.
 - **Coverage**: Claude Code on this PC only. claude.ai web/desktop chats and
   other machines are not visible.
 
@@ -191,9 +194,12 @@ message box naming the step instead of closing silently.
 behind something. Use the tray icon → **Bring to corner**. If the tray icon
 isn't there either, the process isn't running — check the log.
 
-**Multiple copies running:** there is no single-instance guard. Each launch
-starts another one, and they stack invisibly on top of each other. Exit kills
-one at a time. To clear them all:
+**Launching it again:** only one copy runs. A second launch signals the running
+widget to show itself (snapping back to a corner if it is off-screen) and exits;
+the log shows `already running; asked it to show, exiting`. The guard is a
+named mutex, so a crashed or killed copy never blocks the next launch.
+
+If an old pre-guard build is somehow still running alongside, clear everything:
 
 ```powershell
 Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |

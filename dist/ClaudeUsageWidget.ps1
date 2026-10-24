@@ -70,6 +70,22 @@ try {
 } catch { }
 Write-Log '--- start ---'
 
+# Single instance. Copies used to stack invisibly on top of each other, each
+# polling the API and scanning GBs of transcripts. A second launch instead
+# signals the running one to show itself (picked up by the 1 s ticker) and exits.
+$script:ShowEvtName = 'Local\ClaudeUsageWidget.Show'
+if (-not $SelfTest) {
+    $created = $false
+    $script:Mutex = New-Object System.Threading.Mutex($true, 'Local\ClaudeUsageWidget', [ref]$created)
+    if (-not $created) {
+        try { [System.Threading.EventWaitHandle]::OpenExisting($script:ShowEvtName).Set() | Out-Null } catch { }
+        Write-Log 'already running; asked it to show, exiting'
+        exit 0
+    }
+    $script:ShowEvt = New-Object System.Threading.EventWaitHandle($false,
+        [System.Threading.EventResetMode]::AutoReset, $script:ShowEvtName)
+}
+
 try {
     Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase,
                            System.Windows.Forms, System.Drawing
@@ -107,9 +123,14 @@ public class TokRec {
     public DateTime Time; public string SessionId; public string Cwd; public string AgentId;
     public long In; public long CacheRead; public long Out;
 }
-public class TokChild { public bool IsMain; public string Kind; public string Desc; public long Work; }
+public class TokChild {
+    public bool IsMain; public string Kind; public string Desc;
+    public long Work; public long In; public long Out; public long CacheRead;
+}
 public class TokSession {
-    public string SessionId; public string Label; public long Work;
+    public string SessionId; public string Label; public string Cwd;
+    public DateTime Started;      // earliest record seen for the session (UTC), not window-clipped
+    public long Work; public long In; public long Out; public long CacheRead;
     public List<TokChild> Children = new List<TokChild>();
 }
 public class TokSummary {
@@ -292,12 +313,15 @@ public class TokenScanner {
         lock (gate) { meta[agentId] = new string[] { kind, desc }; }
     }
 
+    // {In, Out, CacheRead}
     class Acc {
-        public long Work;
-        public Dictionary<string, long> Kids = new Dictionary<string, long>();
+        public long[] Tot = new long[3];
+        public Dictionary<string, long[]> Kids = new Dictionary<string, long[]>();
         public string MainCwd; public DateTime MainT = DateTime.MinValue;
         public string AnyCwd;  public DateTime AnyT  = DateTime.MinValue;
     }
+
+    static void Add(long[] t, TokRec r) { t[0] += r.In; t[1] += r.Out; t[2] += r.CacheRead; }
 
     static string Leaf(string cwd) {
         try { return Path.GetFileName(cwd.TrimEnd('\\', '/')); } catch { return cwd; }
@@ -306,17 +330,21 @@ public class TokenScanner {
     public TokSummary Summarize(DateTime fromUtc) {
         var s = new TokSummary();
         var by = new Dictionary<string, Acc>();
+        var first = new Dictionary<string, DateTime>();
         lock (gate) {
             foreach (TokRec r in recs.Values) {
+                DateTime f;
+                if (!first.TryGetValue(r.SessionId, out f) || r.Time < f) first[r.SessionId] = r.Time;
                 if (r.Time < fromUtc) continue;
-                long w = r.In + r.Out;
-                s.In += r.In; s.Out += r.Out; s.CacheRead += r.CacheRead; s.Work += w;
+                s.In += r.In; s.Out += r.Out; s.CacheRead += r.CacheRead; s.Work += r.In + r.Out;
 
                 Acc a;
                 if (!by.TryGetValue(r.SessionId, out a)) { a = new Acc(); by[r.SessionId] = a; }
-                a.Work += w;
+                Add(a.Tot, r);
                 string key = r.AgentId ?? "";
-                long cur; a.Kids.TryGetValue(key, out cur); a.Kids[key] = cur + w;
+                long[] k;
+                if (!a.Kids.TryGetValue(key, out k)) { k = new long[3]; a.Kids[key] = k; }
+                Add(k, r);
                 if (!string.IsNullOrEmpty(r.Cwd)) {
                     if (r.AgentId == null && r.Time >= a.MainT) { a.MainT = r.Time; a.MainCwd = r.Cwd; }
                     if (r.Time >= a.AnyT) { a.AnyT = r.Time; a.AnyCwd = r.Cwd; }
@@ -326,14 +354,18 @@ public class TokenScanner {
             foreach (var kv in by) {
                 var ses = new TokSession();
                 ses.SessionId = kv.Key;
-                ses.Work = kv.Value.Work;
+                ses.In = kv.Value.Tot[0]; ses.Out = kv.Value.Tot[1]; ses.CacheRead = kv.Value.Tot[2];
+                ses.Work = ses.In + ses.Out;
+                ses.Started = first[kv.Key];
                 string cwd = kv.Value.MainCwd ?? kv.Value.AnyCwd;
+                ses.Cwd = cwd;
                 ses.Label = !string.IsNullOrEmpty(cwd) ? Leaf(cwd)
                           : (kv.Key.Length > 8 ? kv.Key.Substring(0, 8) : kv.Key);
                 foreach (var k in kv.Value.Kids) {
-                    if (k.Value <= 0) continue;
                     var c = new TokChild();
-                    c.Work = k.Value;
+                    c.In = k.Value[0]; c.Out = k.Value[1]; c.CacheRead = k.Value[2];
+                    c.Work = c.In + c.Out;
+                    if (c.Work <= 0) continue;
                     if (k.Key == "") { c.IsMain = true; c.Kind = "main"; c.Desc = ""; }
                     else {
                         string[] md;
@@ -836,10 +868,15 @@ $script:TokFont = New-Object Windows.Media.FontFamily 'Segoe UI'
 
 # One breakdown row: label (trimmed with ...) on the left, value on the right.
 # Brushes come straight from the skin, like everything else (no resources).
-function New-TokRow([string]$label, [string]$value, [bool]$child, [bool]$indent) {
+function New-TokRow([string]$label, [string]$value, [bool]$child, [bool]$indent, [string]$tip) {
     $s = Get-Skin
     $g = New-Object Windows.Controls.Grid
     $g.Margin = New-Object Windows.Thickness 0, 1, 0, 1
+    if ($tip) {
+        $g.Background = New-Brush '#00000000'    # hit-testable across the whole row
+        $g.ToolTip = $tip
+        [Windows.Controls.ToolTipService]::SetShowDuration($g, 30000)
+    }
     $g.ColumnDefinitions.Add((New-Object Windows.Controls.ColumnDefinition))
     $c2 = New-Object Windows.Controls.ColumnDefinition
     $c2.Width = [Windows.GridLength]::Auto
@@ -869,6 +906,27 @@ function Sum-Work($items) {
     $t
 }
 
+# "Tue 3:05pm" from a UTC DateTime
+function Format-When([DateTime]$utc) {
+    $t = $utc.ToLocalTime()
+    '{0} {1}' -f $t.ToString('ddd'), $t.ToString('h:mmtt').ToLower()
+}
+
+function Format-Split($x) {
+    'in {0} | out {1} | +{2} cache' -f (Format-Tok $x.In), (Format-Tok $x.Out), (Format-Tok $x.CacheRead)
+}
+
+function Get-AgentLabel($k) {
+    if ($k.IsMain) { 'main' } else { ('{0}  {1}' -f $k.Kind, $k.Desc).Trim() }
+}
+
+# Tooltip for a "+N more" row: what was folded away, capped so it stays readable.
+function Format-MoreTip($items, [scriptblock]$name) {
+    $lines = @($items | Select-Object -First 15 | ForEach-Object { '{0}  {1}' -f (Format-Tok $_.Work), (& $name $_) })
+    if (@($items).Count -gt 15) { $lines += '...and {0} more' -f (@($items).Count - 15) }
+    $lines -join "`n"
+}
+
 function Render-Tokens {
     try {
         $sc = $script:Scanner
@@ -894,24 +952,34 @@ function Render-Tokens {
 
         $sessions = @($sum.Sessions)
         if ($sessions.Count -eq 0) { $ui.TokScroll.Visibility = 'Collapsed'; return }
-        foreach ($ss in ($sessions | Select-Object -First 5)) {
-            New-TokRow $ss.Label (Format-Tok $ss.Work) $false $false
+        $top = @($sessions | Select-Object -First 5)
+        # Several sessions in one folder share a label; tell those apart by start time.
+        $dupes = @($top | Group-Object Label | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
+        foreach ($ss in $top) {
+            $when = Format-When $ss.Started
+            $lbl  = if ($dupes -contains $ss.Label) { '{0}  {1}' -f $ss.Label, $when } else { $ss.Label }
+            $tip  = (@($ss.Cwd, "started $when", (Format-Split $ss), "session $($ss.SessionId)") |
+                     Where-Object { $_ }) -join "`n"
+            New-TokRow $lbl (Format-Tok $ss.Work) $false $false $tip
             $kids = @($ss.Children)
             # a main-only session gets no children - its row already is "main"
             if (-not ($kids | Where-Object { -not $_.IsMain })) { continue }
             $show = if ($kids.Count -gt 3) { $kids[0..1] } else { $kids }
             foreach ($k in $show) {
-                $lbl = if ($k.IsMain) { 'main' } else { ('{0}  {1}' -f $k.Kind, $k.Desc).Trim() }
-                New-TokRow $lbl (Format-Tok $k.Work) $true $true
+                $kTip = if ($k.IsMain) { "main conversation`n" + (Format-Split $k) }
+                        else { "$($k.Kind)`n$($k.Desc)`n" + (Format-Split $k) }
+                New-TokRow (Get-AgentLabel $k) (Format-Tok $k.Work) $true $true $kTip
             }
             if ($kids.Count -gt 3) {
                 $rest = $kids[2..($kids.Count - 1)]
-                New-TokRow ('+{0} more agents' -f $rest.Count) (Format-Tok (Sum-Work $rest)) $true $true
+                New-TokRow ('+{0} more agents' -f $rest.Count) (Format-Tok (Sum-Work $rest)) $true $true `
+                    (Format-MoreTip $rest { param($k) Get-AgentLabel $k })
             }
         }
         if ($sessions.Count -gt 5) {
             $rest = $sessions[5..($sessions.Count - 1)]
-            New-TokRow ('+{0} more sessions' -f $rest.Count) (Format-Tok (Sum-Work $rest)) $true $false
+            New-TokRow ('+{0} more sessions' -f $rest.Count) (Format-Tok (Sum-Work $rest)) $true $false `
+                (Format-MoreTip $rest { param($x) '{0}  {1}' -f $x.Label, (Format-When $x.Started) })
         }
     } catch { Write-Log "tokens render failed: $($_.Exception.Message)" }
 }
@@ -1052,6 +1120,18 @@ function Tick-Countdown {
             }
         }
     } catch { Write-Log "ticker failed: $($_.Exception.Message)" }
+}
+
+# A second launch sets the named event; surface this instance in response.
+# If it was parked on no monitor, bring it back to the corner too.
+function Check-ShowRequest {
+    try {
+        if (-not $script:ShowEvt -or -not $script:ShowEvt.WaitOne(0)) { return }
+        Write-Log 'show requested by second launch'
+        $win.Show()
+        if (-not (Test-OnScreen $win.Left $win.Top)) { Snap-Corner 'TR'; Save-Cfg }
+        $win.Activate() | Out-Null
+    } catch { Write-Log "show request failed: $($_.Exception.Message)" }
 }
 
 # ---------------------------------------------------------------- layout
@@ -1282,7 +1362,7 @@ $script:Timer.Add_Tick({ Update-Widget })
 
 $script:Ticker = New-Object Windows.Threading.DispatcherTimer
 $script:Ticker.Interval = [TimeSpan]::FromSeconds(1)
-$script:Ticker.Add_Tick({ Tick-Countdown; Check-Tokens })
+$script:Ticker.Add_Tick({ Tick-Countdown; Check-Tokens; Check-ShowRequest })
 
 # Local file reads only - no network, so it can run far more often than the poll.
 $script:TokTimer = New-Object Windows.Threading.DispatcherTimer
@@ -1329,6 +1409,7 @@ $win.Add_Closed({
     $script:Timer.Stop(); $script:Ticker.Stop(); $script:TokTimer.Stop()
     Save-Cfg
     if ($script:TrayIcon) { $script:TrayIcon.Visible = $false; $script:TrayIcon.Dispose() }
+    try { if ($script:Mutex) { $script:Mutex.ReleaseMutex(); $script:Mutex.Dispose() } } catch { }
     Write-Log '--- closed ---'
     [Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
 })
