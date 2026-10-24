@@ -1,0 +1,10 @@
+# runtime state, not source
+*.log
+ClaudeUsageWidget.json
+
+# editor / OS noise
+.vs/
+*.bak
+*.swp
+Thumbs.db
+desktop.ini
