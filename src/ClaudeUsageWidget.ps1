@@ -130,6 +130,7 @@ public class TokChild {
 public class TokSession {
     public string SessionId; public string Label; public string Cwd;
     public DateTime Started;      // earliest record seen for the session (UTC), not window-clipped
+    public DateTime LastActive;   // newest record in the window (UTC), any agent, cwd or not
     public long Work; public long In; public long Out; public long CacheRead;
     public List<TokChild> Children = new List<TokChild>();
 }
@@ -319,6 +320,7 @@ public class TokenScanner {
         public Dictionary<string, long[]> Kids = new Dictionary<string, long[]>();
         public string MainCwd; public DateTime MainT = DateTime.MinValue;
         public string AnyCwd;  public DateTime AnyT  = DateTime.MinValue;
+        public DateTime LastT = DateTime.MinValue;
     }
 
     static void Add(long[] t, TokRec r) { t[0] += r.In; t[1] += r.Out; t[2] += r.CacheRead; }
@@ -327,7 +329,11 @@ public class TokenScanner {
         try { return Path.GetFileName(cwd.TrimEnd('\\', '/')); } catch { return cwd; }
     }
 
-    public TokSummary Summarize(DateTime fromUtc) {
+    public TokSummary Summarize(DateTime fromUtc) { return Summarize(fromUtc, true); }
+
+    // byRecent: sessions newest-activity first (the live one on top); else largest first.
+    // Child agent rows always sort largest first.
+    public TokSummary Summarize(DateTime fromUtc, bool byRecent) {
         var s = new TokSummary();
         var by = new Dictionary<string, Acc>();
         var first = new Dictionary<string, DateTime>();
@@ -341,6 +347,7 @@ public class TokenScanner {
                 Acc a;
                 if (!by.TryGetValue(r.SessionId, out a)) { a = new Acc(); by[r.SessionId] = a; }
                 Add(a.Tot, r);
+                if (r.Time > a.LastT) a.LastT = r.Time;
                 string key = r.AgentId ?? "";
                 long[] k;
                 if (!a.Kids.TryGetValue(key, out k)) { k = new long[3]; a.Kids[key] = k; }
@@ -357,6 +364,7 @@ public class TokenScanner {
                 ses.In = kv.Value.Tot[0]; ses.Out = kv.Value.Tot[1]; ses.CacheRead = kv.Value.Tot[2];
                 ses.Work = ses.In + ses.Out;
                 ses.Started = first[kv.Key];
+                ses.LastActive = kv.Value.LastT;
                 string cwd = kv.Value.MainCwd ?? kv.Value.AnyCwd;
                 ses.Cwd = cwd;
                 ses.Label = !string.IsNullOrEmpty(cwd) ? Leaf(cwd)
@@ -378,7 +386,13 @@ public class TokenScanner {
                 s.Sessions.Add(ses);
             }
         }
-        s.Sessions.Sort(delegate(TokSession x, TokSession y) { return y.Work.CompareTo(x.Work); });
+        if (byRecent)
+            s.Sessions.Sort(delegate(TokSession x, TokSession y) {
+                int c = y.LastActive.CompareTo(x.LastActive);
+                return c != 0 ? c : y.Work.CompareTo(x.Work);
+            });
+        else
+            s.Sessions.Sort(delegate(TokSession x, TokSession y) { return y.Work.CompareTo(x.Work); });
         return s;
     }
 }
@@ -398,7 +412,7 @@ $script:Cfg = [ordered]@{
     Left = $null; Top = $null
     Interval = 10; Opacity = 0.96; Compact = $false; Topmost = $true
     AlertAt = 85; Skin = 'Clay'
-    TokenWindow = 'Session'; TokExpanded = $false
+    TokenWindow = 'Session'; TokExpanded = $false; TokSort = 'Recent'
 }
 $script:Buckets   = @{}
 $script:LastAlert = @{}
@@ -406,6 +420,8 @@ $script:TrayIcon  = $null
 $script:Busy      = $false
 
 $script:TokWindows  = @('Session', 'Today', 'Week')
+$script:TokSorts    = @('Recent', 'Largest')
+$script:TokLiveSecs = 120      # a session active this recently is flagged live
 $script:Scanner     = New-Object TokenScanner $script:ProjDir
 $script:TokRendered = -1
 $script:TokLastErr  = $null
@@ -463,7 +479,8 @@ if ($SelfTest) {
         '  work {0} ({1})  in {2}  out {3}  cacheRead {4}' -f `
             (Format-Tok $s.Work), $s.Work, $s.In, $s.Out, $s.CacheRead
         foreach ($ss in @($s.Sessions) | Select-Object -First 5) {
-            '  {0,-28} {1,8}' -f $ss.Label, (Format-Tok $ss.Work)
+            '  {0,-28} {1,8}  last {2}' -f $ss.Label, (Format-Tok $ss.Work),
+                $ss.LastActive.ToLocalTime().ToString('ddd HH:mm')
             foreach ($k in @($ss.Children) | Select-Object -First 4) {
                 '      {0,-24} {1,8}' -f (($k.Kind + '  ' + $k.Desc).Trim()), (Format-Tok $k.Work)
             }
@@ -689,6 +706,10 @@ function Load-Cfg {
             Write-Log "unknown token window '$($script:Cfg.TokenWindow)'; using Session"
             $script:Cfg.TokenWindow = 'Session'
         }
+        if ($script:TokSorts -notcontains [string]$script:Cfg.TokSort) {
+            Write-Log "unknown token sort '$($script:Cfg.TokSort)'; using Recent"
+            $script:Cfg.TokSort = 'Recent'
+        }
         $script:Cfg.TokExpanded = [bool]$script:Cfg.TokExpanded
         Write-Log "config loaded (skin=$($script:Cfg.Skin))"
     } catch { Write-Log "config load failed: $($_.Exception.Message)" }
@@ -867,8 +888,11 @@ function Set-Bucket($b, $pctBlock, $bar, $track) {
 $script:TokFont = New-Object Windows.Media.FontFamily 'Segoe UI'
 
 # One breakdown row: label (trimmed with ...) on the left, value on the right.
+# Session rows also get an age column between them (never trimmed - the label
+# gives way first), led by an accent dot when the session is live.
 # Brushes come straight from the skin, like everything else (no resources).
-function New-TokRow([string]$label, [string]$value, [bool]$child, [bool]$indent, [string]$tip) {
+function New-TokRow([string]$label, [string]$value, [bool]$child, [bool]$indent, [string]$tip,
+                    [string]$age = '', [bool]$live = $false) {
     $s = Get-Skin
     $g = New-Object Windows.Controls.Grid
     $g.Margin = New-Object Windows.Thickness 0, 1, 0, 1
@@ -878,9 +902,11 @@ function New-TokRow([string]$label, [string]$value, [bool]$child, [bool]$indent,
         [Windows.Controls.ToolTipService]::SetShowDuration($g, 30000)
     }
     $g.ColumnDefinitions.Add((New-Object Windows.Controls.ColumnDefinition))
-    $c2 = New-Object Windows.Controls.ColumnDefinition
-    $c2.Width = [Windows.GridLength]::Auto
-    $g.ColumnDefinitions.Add($c2)
+    foreach ($i in 1, 2) {
+        $c = New-Object Windows.Controls.ColumnDefinition
+        $c.Width = [Windows.GridLength]::Auto
+        $g.ColumnDefinitions.Add($c)
+    }
 
     $size = if ($child) { 9.5 } else { 10.5 }
     $l = New-Object Windows.Controls.TextBlock
@@ -893,7 +919,29 @@ function New-TokRow([string]$label, [string]$value, [bool]$child, [bool]$indent,
     $v.Text = $value; $v.FontFamily = $script:TokFont; $v.FontSize = $size
     $v.Foreground = New-Brush ($(if ($child) { $s.Sub } else { $s.Val }))
     if (-not $child) { $v.FontWeight = [Windows.FontWeights]::SemiBold }
-    [Windows.Controls.Grid]::SetColumn($v, 1)
+    [Windows.Controls.Grid]::SetColumn($v, 2)
+
+    if ($age) {
+        $ap = New-Object Windows.Controls.StackPanel
+        $ap.Orientation = [Windows.Controls.Orientation]::Horizontal
+        $ap.Margin = New-Object Windows.Thickness 0, 0, 8, 0
+        $ap.VerticalAlignment = [Windows.VerticalAlignment]::Center
+        if ($live) {
+            $dot = New-Object Windows.Shapes.Ellipse
+            $dot.Width = 5; $dot.Height = 5
+            $dot.Margin = New-Object Windows.Thickness 0, 0, 4, 0
+            $dot.VerticalAlignment = [Windows.VerticalAlignment]::Center
+            $dot.Fill = New-Brush $s.Accent
+            $ap.Children.Add($dot) | Out-Null
+        }
+        $a = New-Object Windows.Controls.TextBlock
+        $a.Text = $age; $a.FontFamily = $script:TokFont; $a.FontSize = 9.5
+        $a.VerticalAlignment = [Windows.VerticalAlignment]::Center
+        $a.Foreground = New-Brush ($(if ($live) { $s.Accent } else { $s.Sub }))
+        $ap.Children.Add($a) | Out-Null
+        [Windows.Controls.Grid]::SetColumn($ap, 1)
+        $g.Children.Add($ap) | Out-Null
+    }
 
     $g.Children.Add($l) | Out-Null
     $g.Children.Add($v) | Out-Null
@@ -910,6 +958,21 @@ function Sum-Work($items) {
 function Format-When([DateTime]$utc) {
     $t = $utc.ToLocalTime()
     '{0} {1}' -f $t.ToString('ddd'), $t.ToString('h:mmtt').ToLower()
+}
+
+# "just now" / "4m ago" / "2h 11m ago" / "Tue 3:05pm" from a UTC DateTime.
+# TimeSpan components, never [int] on Total* - [int] rounds.
+function Format-Age([DateTime]$utc) {
+    if ($utc -eq [DateTime]::MinValue) { return '' }
+    $d = [DateTime]::UtcNow - $utc
+    if ($d.TotalMinutes -lt 1) { return 'just now' }
+    if ($d.TotalHours -lt 1)   { return ('{0}m ago' -f $d.Minutes) }
+    if ($d.TotalHours -lt 24)  { return ('{0}h {1}m ago' -f $d.Hours, $d.Minutes) }
+    Format-When $utc
+}
+
+function Test-Live([DateTime]$utc) {
+    ([DateTime]::UtcNow - $utc).TotalSeconds -lt $script:TokLiveSecs
 }
 
 function Format-Split($x) {
@@ -941,7 +1004,7 @@ function Render-Tokens {
         if ($sc.Generation -eq 0) { $ui.TokVal.Text = '--'; $ui.TokSub.Text = 'scanning...'; return }
         if ($sc.Missing) { $ui.TokVal.Text = '--'; $ui.TokSub.Text = 'no Claude Code logs found'; return }
 
-        $sum = $sc.Summarize((Get-TokStart))
+        $sum = $sc.Summarize((Get-TokStart), ([string]$script:Cfg.TokSort -ne 'Largest'))
         $ui.TokVal.Text = Format-Tok $sum.Work
         $ui.TokSub.Text = if ($sum.Work -eq 0 -and $sum.CacheRead -eq 0) {
             'no Claude Code activity in window'
@@ -957,10 +1020,15 @@ function Render-Tokens {
         $dupes = @($top | Group-Object Label | Where-Object { $_.Count -gt 1 } | ForEach-Object { $_.Name })
         foreach ($ss in $top) {
             $when = Format-When $ss.Started
+            $age  = Format-Age $ss.LastActive
+            $live = Test-Live $ss.LastActive
             $lbl  = if ($dupes -contains $ss.Label) { '{0}  {1}' -f $ss.Label, $when } else { $ss.Label }
-            $tip  = (@($ss.Cwd, "started $when", (Format-Split $ss), "session $($ss.SessionId)") |
+            $last = if ($live) { "last active $age (live)" } else { "last active $age" }
+            $tip  = (@($ss.Cwd, "started $when", $last, (Format-Split $ss), "session $($ss.SessionId)",
+                       'Named after the folder Claude Code was launched from,',
+                       'not necessarily where it is editing files.') |
                      Where-Object { $_ }) -join "`n"
-            New-TokRow $lbl (Format-Tok $ss.Work) $false $false $tip
+            New-TokRow $lbl (Format-Tok $ss.Work) $false $false $tip $age $live
             $kids = @($ss.Children)
             # a main-only session gets no children - its row already is "main"
             if (-not ($kids | Where-Object { -not $_.IsMain })) { continue }
@@ -979,7 +1047,7 @@ function Render-Tokens {
         if ($sessions.Count -gt 5) {
             $rest = $sessions[5..($sessions.Count - 1)]
             New-TokRow ('+{0} more sessions' -f $rest.Count) (Format-Tok (Sum-Work $rest)) $true $false `
-                (Format-MoreTip $rest { param($x) '{0}  {1}' -f $x.Label, (Format-When $x.Started) })
+                (Format-MoreTip $rest { param($x) '{0}  {1}' -f $x.Label, (Format-Age $x.LastActive) })
         }
     } catch { Write-Log "tokens render failed: $($_.Exception.Message)" }
 }
@@ -1136,15 +1204,39 @@ function Check-ShowRequest {
 
 # ---------------------------------------------------------------- layout
 
+# Device pixels -> WPF DIPs, as @(sx, sy). Screen reports physical pixels while
+# $win.Left/Top are DIPs; at 150% scaling they differ by 1.5x. Taken from the
+# window's own HwndSource; before that exists, from the desktop DC's DPI.
+function Get-DipScale {
+    try {
+        $src = [Windows.PresentationSource]::FromVisual($win)
+        if ($src -and $src.CompositionTarget) {
+            $m = $src.CompositionTarget.TransformFromDevice
+            if ($m.M11 -gt 0 -and $m.M22 -gt 0) { return @([double]$m.M11, [double]$m.M22) }
+        }
+    } catch { }
+    try {
+        $gr = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+        $sx = 96.0 / $gr.DpiX; $sy = 96.0 / $gr.DpiY
+        $gr.Dispose()
+        return @($sx, $sy)
+    } catch { }
+    @(1.0, 1.0)
+}
+
 # Exact check against real monitor working areas. The virtual-screen bounding
 # box is not enough: an L-shaped arrangement leaves dead rectangles inside it,
 # and a window parked there is running, on no monitor, invisible.
+# $l/$t are DIPs; each working area is converted to DIPs before comparing.
 function Test-OnScreen([double]$l, [double]$t) {
     try {
+        $k = Get-DipScale
         foreach ($sc in [System.Windows.Forms.Screen]::AllScreens) {
             $wa = $sc.WorkingArea
-            if ($l -ge ($wa.Left - 40) -and $l -le ($wa.Right - 80) -and
-                $t -ge ($wa.Top - 10)  -and $t -le ($wa.Bottom - 40)) { return $true }
+            $wl = $wa.Left * $k[0]; $wr = $wa.Right * $k[0]
+            $wt = $wa.Top * $k[1];  $wb = $wa.Bottom * $k[1]
+            if ($l -ge ($wl - 40) -and $l -le ($wr - 80) -and
+                $t -ge ($wt - 10) -and $t -le ($wb - 40)) { return $true }
         }
     } catch { return $true }
     $false
@@ -1240,6 +1332,21 @@ foreach ($pair in @(@('Current session (5h)','Session'), @('Today','Today'), @('
 }
 $menu.Items.Add($mTok) | Out-Null
 
+$mSort = New-MenuItem 'Sort sessions by'
+foreach ($pair in @(@('Most recent','Recent'), @('Largest','Largest'))) {
+    $mi = New-MenuItem $pair[0] $null $true
+    $mi.Tag = $pair[1]
+    $mi.Add_Click({
+        param($s, $e)
+        $script:Cfg.TokSort = [string]$s.Tag
+        foreach ($x in $mSort.Items) { $x.IsChecked = ($x.Tag -eq $s.Tag) }
+        Render-Tokens
+        Save-Cfg
+    })
+    $mSort.Items.Add($mi) | Out-Null
+}
+$menu.Items.Add($mSort) | Out-Null
+
 $mOp = New-MenuItem 'Opacity'
 foreach ($o in 1.0, 0.9, 0.75, 0.6) {
     $mi = New-MenuItem ('{0:P0}' -f $o) $null $true ([Math]::Abs($script:Cfg.Opacity - $o) -lt 0.01)
@@ -1297,6 +1404,7 @@ function Sync-MenuChecks {
         $x.IsChecked = ([Math]::Abs([double]$x.Tag - [double]$script:Cfg.Opacity) -lt 0.01)
     }
     foreach ($x in $mTok.Items)  { $x.IsChecked = ([string]$x.Tag -eq [string]$script:Cfg.TokenWindow) }
+    foreach ($x in $mSort.Items) { $x.IsChecked = ([string]$x.Tag -eq [string]$script:Cfg.TokSort) }
     $miCompact.IsChecked = [bool]$script:Cfg.Compact
     $miTop.IsChecked     = [bool]$script:Cfg.Topmost
 }
@@ -1377,7 +1485,7 @@ $win.Add_SourceInitialized({
     try {
         $mons = ([System.Windows.Forms.Screen]::AllScreens | ForEach-Object {
             $_.WorkingArea.ToString() }) -join ' | '
-        Write-Log "monitors: $mons"
+        Write-Log ("monitors: {0}  (dip scale {1:0.###})" -f $mons, (Get-DipScale)[0])
     } catch { }
 
     $placed = $false

@@ -48,7 +48,8 @@ Edit `src\`, then run `build.ps1` to copy into `dist\`. Restart the widget
 | Right-click tray icon | Show-hide, Bring to corner, Refresh, Exit |
 
 Menu: Refresh now · Skin · Compact mode · Always on top · Poll every
-(1/5/10/15/30/60 min) · Token window (Current session / Today / This week) · Opacity · Snap to corner · Start with Windows ·
+(1/5/10/15/30/60 min) · Token window (Current session / Today / This week) ·
+Sort sessions by (Most recent / Largest) · Opacity · Snap to corner · Start with Windows ·
 Open log · Hide to tray · Exit.
 
 Skins: Clay, Midnight, Synthwave, Nord, Terminal, Paper.
@@ -57,7 +58,7 @@ Skins: Clay, Midnight, Synthwave, Nord, Terminal, Paper.
 
 | What | Path |
 | --- | --- |
-| Settings (position, skin, interval, opacity, token window) | `%LOCALAPPDATA%\ClaudeUsageWidget.json` |
+| Settings (position, skin, interval, opacity, token window, session sort) | `%LOCALAPPDATA%\ClaudeUsageWidget.json` |
 | Log | `%LOCALAPPDATA%\ClaudeUsageWidget.log` |
 | OAuth token it reads (written by Claude Code) | `%USERPROFILE%\.claude\.credentials.json` |
 | Transcripts it reads for token counts | `%USERPROFILE%\.claude\projects\**\*.jsonl` |
@@ -111,12 +112,25 @@ Subagents live in `<session>\subagents\agent-<id>.jsonl` with a
   bury the signal.
 - **Window**: Session and Week start at the matching bar's `resets_at` minus
   5h / 7d, so they line up with the bars. Today starts at local midnight.
-- **Breakdown**: top 5 sessions (labelled by working folder), each with up to
-  3 rows for `main` and its subagents. A session without subagents gets no
-  child rows. Sessions sharing a folder name get their start time appended
-  (`Meowntain  Tue 8:55pm`). Hover any row for the full path, start time,
-  in/out/cache split and session id; hover a `+N more` row to see what it
-  folds away.
+- **Breakdown**: top 5 sessions, each with up to 3 rows for `main` and its
+  subagents (children always sort largest first). A session without subagents
+  gets no child rows. Sessions sharing a folder name get their start time
+  appended (`Meowntain  Tue 8:55pm`). Hover any row for the full path, start
+  time, last activity, in/out/cache split and session id; hover a `+N more`
+  row to see what it folds away.
+- **Sort**: right-click → **Sort sessions by**. *Most recent* (the default)
+  puts the session with the newest activity on top, so the one you are
+  working in is first. *Largest* sorts by work tokens, as older versions did.
+- **Age / live**: each session row shows when it last did anything (`just now`,
+  `4m ago`, `2h 11m ago`, then `Tue 3:05pm` past 24h), counting subagent
+  activity too. A session active in the last 2 minutes is **live**: its age is
+  drawn in the skin's accent color with a small dot in front. The age refreshes
+  with each 30 s rescan.
+- **Session names are the launch folder.** The label is the leaf of the
+  session's `cwd`, the directory Claude Code was started in. It never changes,
+  however many other folders the session edits files in, so a session launched
+  from `ThumbsUp` that is working in `ClimbWithMe` still reads `ThumbsUp`. Use
+  the live dot and the age to find the running session, not the name.
 - **Coverage**: Claude Code on this PC only. claude.ai web/desktop chats and
   other machines are not visible.
 
@@ -179,7 +193,7 @@ menu built
 tray ready
 config loaded (skin=Clay)
 skin applied: Clay
-monitors: {X=5760,Y=0,...} | {X=-2880,Y=881,...} | {X=0,Y=0,...}
+monitors: {X=5760,Y=0,...} | {X=-2880,Y=881,...} | {X=0,Y=0,...}  (dip scale 0.667)
 positioned at 2280,2
 refresh ok: session 47% weekly 15%
 running
@@ -207,13 +221,16 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
   Stop-Process -Id { $_.ProcessId } -Force
 ```
 
-## Known rough edge
+## Off-screen check and display scaling
 
-`Test-OnScreen` compares WPF DIP coordinates against `System.Windows.Forms.Screen`
-physical pixels. On a display running at 150% scaling those differ by 1.5×, so
-the off-screen check is sloppier than it looks. It is harmless in practice
-because the fallback just re-corners the window, but it is wrong and worth fixing
-if it ever misbehaves.
+`Test-OnScreen` compares the window's WPF position (DIPs) against each
+monitor's `System.Windows.Forms.Screen` working area, which is in physical
+pixels. At 150% scaling those differ by 1.5×, so each working area is converted
+to DIPs first, using the window's own DPI transform from `PresentationSource`
+(or the desktop DPI if the window has no HwndSource yet). The scale in use is
+logged on the `monitors:` line at startup (`dip scale 0.667` at 150%). This
+matters on layouts with dead gaps in the virtual desktop: a saved position in
+the gap is detected and the window goes back to the corner.
 
 ## Requirements
 
