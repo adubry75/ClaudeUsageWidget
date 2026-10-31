@@ -1,7 +1,7 @@
 # Claude Usage Widget
 
-A small always-on-top desktop widget showing Claude 5-hour session and weekly
-limit usage, with a live tray gauge, plus a token counter across every Claude
+A small always-on-top desktop widget showing Claude weekly limit usage, with a
+live tray gauge, plus a token counter across every Claude
 Code agent on this machine. Costs zero model tokens: it is a plain REST call
 and local file reads, never a model call.
 
@@ -48,7 +48,7 @@ Edit `src\`, then run `build.ps1` to copy into `dist\`. Restart the widget
 | Right-click tray icon | Show-hide, Bring to corner, Refresh, Exit |
 
 Menu: Refresh now · Skin · Compact mode · Always on top · Poll every
-(1/5/10/15/30/60 min) · Token window (Current session / Today / This week) ·
+(1/5/10/15/30/60 min) · Token window (Today / This week) ·
 Sort sessions by (Most recent / Largest) · Opacity · Snap to corner · Start with Windows ·
 Open log · Hide to tray · Exit.
 
@@ -78,6 +78,12 @@ User-Agent: claude-code/2.0.31
 Returns `five_hour`, `seven_day`, `seven_day_opus`, `seven_day_sonnet`, each
 `{ utilization: 0-100, resets_at }`, plus an optional `extra_usage` block. Any
 bucket can be `null` depending on plan, so every one is nil-checked.
+
+The widget ignores `five_hour`. Anthropic dropped the 5-hour session limit for
+Ultra (formerly Max 20x) on 2026-10-30 and the bucket now comes back `null`, so
+the Session bar, its tray gauge and alert, and the "Current session" token
+window were removed; the weekly bar drives the tray gauge. To bring them back,
+revert the commit that removed them.
 
 **This endpoint is undocumented.** It is the private route Claude Code's
 `/usage` command uses. Anthropic can change or remove it without notice; if the
@@ -110,8 +116,8 @@ Subagents live in `<session>\subagents\agent-<id>.jsonl` with a
   cache reads are listed separately. Cache reads are roughly 100x everything
   else (context re-read every turn), so folding them into the headline would
   bury the signal.
-- **Window**: Session and Week start at the matching bar's `resets_at` minus
-  5h / 7d, so they line up with the bars. Today starts at local midnight.
+- **Window**: Today (the default) starts at local midnight. Week starts at the
+  weekly bar's `resets_at` minus 7d, so it lines up with the bar.
 - **Breakdown**: top 5 sessions, each with up to 3 rows for `main` and its
   subagents (children always sort largest first). A session without subagents
   gets no child rows. Sessions sharing a folder name get their start time
@@ -195,7 +201,7 @@ config loaded (skin=Clay)
 skin applied: Clay
 monitors: {X=5760,Y=0,...} | {X=-2880,Y=881,...} | {X=0,Y=0,...}  (dip scale 0.667)
 positioned at 2280,2
-refresh ok: session 47% weekly 15%
+refresh ok: weekly 15%
 running
 tokens: 94 files, 10941 recs, 10636 ms
 ```

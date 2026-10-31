@@ -1,5 +1,5 @@
 # ClaudeUsageWidget.ps1
-# Always-on-top desktop widget for Claude 5-hour + weekly limit usage.
+# Always-on-top desktop widget for Claude weekly limit usage.
 # Data: GET https://api.anthropic.com/api/oauth/usage (undocumented route Claude Code's /usage uses)
 # Costs zero model tokens. Token is read from Claude Code's own credentials file.
 #
@@ -412,14 +412,14 @@ $script:Cfg = [ordered]@{
     Left = $null; Top = $null
     Interval = 10; Opacity = 0.96; Compact = $false; Topmost = $true
     AlertAt = 85; Skin = 'Clay'
-    TokenWindow = 'Session'; TokExpanded = $false; TokSort = 'Recent'
+    TokenWindow = 'Today'; TokExpanded = $false; TokSort = 'Recent'
 }
 $script:Buckets   = @{}
 $script:LastAlert = @{}
 $script:TrayIcon  = $null
 $script:Busy      = $false
 
-$script:TokWindows  = @('Session', 'Today', 'Week')
+$script:TokWindows  = @('Today', 'Week')
 $script:TokSorts    = @('Recent', 'Largest')
 $script:TokLiveSecs = 120      # a session active this recently is flagged live
 $script:Scanner     = New-Object TokenScanner $script:ProjDir
@@ -445,14 +445,11 @@ function Format-Tok($n) {
     }
 }
 
-# Session and Week line up with the bars via resets_at; until the first API
-# response (or if the bucket / resets_at is null) fall back to now - span.
+# Week lines up with the weekly bar via resets_at; until the first API
+# response (or if the bucket / resets_at is null) fall back to now - 7d.
 function Get-TokStart {
-    switch ([string]$script:Cfg.TokenWindow) {
-        'Today' { return [DateTime]::Today.ToUniversalTime() }
-        'Week'  { $b = $script:Buckets['Weekly'];   $span = [TimeSpan]::FromDays(7) }
-        default { $b = $script:Buckets['FiveHour']; $span = [TimeSpan]::FromHours(5) }
-    }
+    if ([string]$script:Cfg.TokenWindow -eq 'Today') { return [DateTime]::Today.ToUniversalTime() }
+    $b = $script:Buckets['Weekly']; $span = [TimeSpan]::FromDays(7)
     if ($b -and $b.resets_at) {
         try { return ([DateTimeOffset]$b.resets_at).UtcDateTime - $span } catch { }
     }
@@ -468,7 +465,6 @@ if ($SelfTest) {
     if ($Since) {
         [void]$wins.Add(@('since', [DateTimeOffset]::Parse($Since).UtcDateTime))
     } else {
-        [void]$wins.Add(@('session (now-5h)', [DateTime]::UtcNow.AddHours(-5)))
         [void]$wins.Add(@('today', [DateTime]::Today.ToUniversalTime()))
         [void]$wins.Add(@('week (now-7d)', [DateTime]::UtcNow.AddDays(-7)))
     }
@@ -571,18 +567,6 @@ $xaml = @'
         </Grid>
 
         <Grid Margin="0,0,0,5">
-          <TextBlock x:Name="LblFh" Text="Session" FontFamily="Segoe UI" FontSize="11"
-                     VerticalAlignment="Bottom" Foreground="#FF9BA3B1"/>
-          <TextBlock x:Name="FhPct" HorizontalAlignment="Right" FontFamily="Segoe UI"
-                     FontSize="15" FontWeight="SemiBold" Foreground="#FFF6F7F9" Text="--"/>
-        </Grid>
-        <Border x:Name="FhTrack" Height="8" CornerRadius="4" Background="#FF2E3440">
-          <Border x:Name="FhBar" HorizontalAlignment="Left" Width="0" CornerRadius="4"/>
-        </Border>
-        <TextBlock x:Name="FhReset" FontFamily="Segoe UI" FontSize="9.5"
-                   Foreground="#FF6E7684" Margin="0,4,0,0" Text=""/>
-
-        <Grid Margin="0,13,0,5">
           <TextBlock x:Name="LblWk" Text="Weekly" FontFamily="Segoe UI" FontSize="11"
                      VerticalAlignment="Bottom" Foreground="#FF9BA3B1"/>
           <TextBlock x:Name="WkPct" HorizontalAlignment="Right" FontFamily="Segoe UI"
@@ -602,7 +586,7 @@ $xaml = @'
               <ColumnDefinition Width="Auto"/>
               <ColumnDefinition Width="Auto"/>
             </Grid.ColumnDefinitions>
-            <TextBlock x:Name="LblTok" Text="Tokens - session" FontFamily="Segoe UI" FontSize="11"
+            <TextBlock x:Name="LblTok" Text="Tokens - today" FontFamily="Segoe UI" FontSize="11"
                        VerticalAlignment="Bottom" Foreground="#FF9BA3B1"/>
             <TextBlock x:Name="TokVal" Grid.Column="1" FontFamily="Segoe UI" FontSize="15"
                        FontWeight="SemiBold" Foreground="#FFF6F7F9" Text="--"/>
@@ -667,7 +651,6 @@ try {
 $ui = @{}
 try {
     'Root','Gloss','Dot','Title','Stamp',
-    'LblFh','FhPct','FhTrack','FhBar','FhReset',
     'LblWk','WkPct','WkTrack','WkBar','WkReset',
     'TokBlock','TokHdr','LblTok','TokVal','TokChev','TokSub','TokScroll','TokList',
     'Detail','OpusRow','LblOp','OpPct','OpTrack','OpBar',
@@ -703,8 +686,8 @@ function Load-Cfg {
             $script:Cfg.Skin = 'Clay'
         }
         if ($script:TokWindows -notcontains [string]$script:Cfg.TokenWindow) {
-            Write-Log "unknown token window '$($script:Cfg.TokenWindow)'; using Session"
-            $script:Cfg.TokenWindow = 'Session'
+            Write-Log "unknown token window '$($script:Cfg.TokenWindow)'; using Today"
+            $script:Cfg.TokenWindow = 'Today'
         }
         if ($script:TokSorts -notcontains [string]$script:Cfg.TokSort) {
             Write-Log "unknown token sort '$($script:Cfg.TokSort)'; using Recent"
@@ -760,12 +743,12 @@ function Apply-Skin {
         $ui.Title.Foreground = New-Brush $s.Accent
         $ui.Err.Foreground   = New-Brush ($s.Crit[1])
 
-        foreach ($n in 'Stamp','FhReset','WkReset','TokChev','TokSub') { $ui[$n].Foreground = New-Brush $s.Sub }
-        foreach ($n in 'LblFh','LblWk','LblOp','LblSo','LblEx','ExTxt','LblTok') {
+        foreach ($n in 'Stamp','WkReset','TokChev','TokSub') { $ui[$n].Foreground = New-Brush $s.Sub }
+        foreach ($n in 'LblWk','LblOp','LblSo','LblEx','ExTxt','LblTok') {
             $ui[$n].Foreground = New-Brush $s.Label
         }
-        foreach ($n in 'FhPct','WkPct','OpPct','SoPct','TokVal') { $ui[$n].Foreground = New-Brush $s.Val }
-        foreach ($n in 'FhTrack','WkTrack','OpTrack','SoTrack') {
+        foreach ($n in 'WkPct','OpPct','SoPct','TokVal') { $ui[$n].Foreground = New-Brush $s.Val }
+        foreach ($n in 'WkTrack','OpTrack','SoTrack') {
             $ui[$n].Background = New-Brush $s.Track
         }
 
@@ -856,7 +839,6 @@ function Paint-Bar($bar, $track, [double]$pct, [bool]$animate = $true) {
 
 function Repaint-Bars {
     foreach ($p in @(
-        @{ Bar=$ui.FhBar; Track=$ui.FhTrack; Key='FiveHour' },
         @{ Bar=$ui.WkBar; Track=$ui.WkTrack; Key='Weekly' },
         @{ Bar=$ui.OpBar; Track=$ui.OpTrack; Key='Opus' },
         @{ Bar=$ui.SoBar; Track=$ui.SoTrack; Key='Sonnet' })) {
@@ -994,7 +976,7 @@ function Render-Tokens {
     try {
         $sc = $script:Scanner
         $open = [bool]$script:Cfg.TokExpanded
-        $name = @{ Session = 'session'; Today = 'today'; Week = 'week' }[[string]$script:Cfg.TokenWindow]
+        $name = @{ Today = 'today'; Week = 'week' }[[string]$script:Cfg.TokenWindow]
         $ui.LblTok.Text = "Tokens - $name"
         $ui.TokChev.Text = if ($open) { 'v' } else { '>' }
         $ui.TokScroll.Visibility = if ($open) { 'Visible' } else { 'Collapsed' }
@@ -1113,11 +1095,9 @@ function Update-Widget {
         $ui.Err.Visibility = 'Collapsed'
 
         $script:Buckets = @{
-            FiveHour = $u.five_hour; Weekly = $u.seven_day
-            Opus = $u.seven_day_opus; Sonnet = $u.seven_day_sonnet
+            Weekly = $u.seven_day; Opus = $u.seven_day_opus; Sonnet = $u.seven_day_sonnet
         }
 
-        Set-Bucket $u.five_hour $ui.FhPct $ui.FhBar $ui.FhTrack
         Set-Bucket $u.seven_day $ui.WkPct $ui.WkBar $ui.WkTrack
 
         if ($u.seven_day_opus) {
@@ -1137,16 +1117,14 @@ function Update-Widget {
         } else { $ui.ExtraRow.Visibility = 'Collapsed' }
 
         Tick-Countdown
-        Render-Tokens      # session / week start may have moved with new resets_at
+        Render-Tokens      # week start may have moved with new resets_at
 
-        $fh =if ($u.five_hour) { [double]$u.five_hour.utilization } else { 0 }
         $wk = if ($u.seven_day) { [double]$u.seven_day.utilization } else { 0 }
-        Update-Tray $fh ('Session {0:0}%  |  Weekly {1:0}%' -f $fh, $wk)
-        Check-Alert 'Session' $fh
-        Check-Alert 'Weekly'  $wk
+        Update-Tray $wk ('Weekly {0:0}%' -f $wk)
+        Check-Alert 'Weekly' $wk
 
         $ui.Stamp.Text = (Get-Date).ToString('h:mm tt').ToLower()
-        Write-Log ('refresh ok: session {0:0}% weekly {1:0}%' -f $fh, $wk)
+        Write-Log ('refresh ok: weekly {0:0}%' -f $wk)
     }
     catch {
         $msg = $_.Exception.Message
@@ -1179,13 +1157,10 @@ function Check-Alert([string]$name, [double]$pct) {
 
 function Tick-Countdown {
     try {
-        $f = $script:Buckets['FiveHour']; $w = $script:Buckets['Weekly']
-        $ui.FhReset.Text = if ($f) { Format-Reset $f.resets_at } else { '' }
+        $w = $script:Buckets['Weekly']
         $ui.WkReset.Text = if ($w) { Format-Reset $w.resets_at } else { '' }
-        foreach ($b in @($f, $w)) {
-            if ($b -and $b.resets_at -and ([DateTimeOffset]$b.resets_at) -lt [DateTimeOffset]::UtcNow) {
-                Update-Widget; break
-            }
+        if ($w -and $w.resets_at -and ([DateTimeOffset]$w.resets_at) -lt [DateTimeOffset]::UtcNow) {
+            Update-Widget
         }
     } catch { Write-Log "ticker failed: $($_.Exception.Message)" }
 }
@@ -1260,7 +1235,6 @@ function Apply-Cfg {
     $v = if ($script:Cfg.Compact) { 'Collapsed' } else { 'Visible' }
     $ui.Detail.Visibility = $v
     $ui.TokBlock.Visibility = $v
-    $ui.FhReset.Visibility = $v
     $ui.WkReset.Visibility = $v
 }
 
@@ -1318,7 +1292,7 @@ foreach ($n in 1, 5, 10, 15, 30, 60) {
 $menu.Items.Add($mInt) | Out-Null
 
 $mTok = New-MenuItem 'Token window'
-foreach ($pair in @(@('Current session (5h)','Session'), @('Today','Today'), @('This week','Week'))) {
+foreach ($pair in @(@('Today','Today'), @('This week','Week'))) {
     $mi = New-MenuItem $pair[0] $null $true
     $mi.Tag = $pair[1]
     $mi.Add_Click({
